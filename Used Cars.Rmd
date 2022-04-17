@@ -1,0 +1,431 @@
+---
+title: "Data Cleaning Project Used Cars in California"
+output: rmarkdown::github_document
+---
+
+The purpose of this project is for me to get experience with data cleaning using both base R and tidyverse (dplyr) libraries along with regex
+patterns that will be used to extract missing values from other variables. The dataset is on used car listing from Craigslist. The dataset is
+pretty messy with a lot of duplicate observation with different values given (e.g. the same car may be posted multiple times with different 
+prices or with the lister omitting certain information for specific variables). Listers may also place relevant information in the 
+description instead of placing it in the designated column - something that we can try to fix using regex patterns to remedy. 
+
+# Libraries and Data Importing
+```{r}
+library(tidyverse)
+vehicles <- read_csv("C:/Users/Wetauzer/Desktop/data/unsorted/vehicles.csv")
+```
+
+# Data Cleaning
+
+
+## Summary of Vehicles
+To start off, we will restrict the dataset to just cars in California to make the dataset easier to handle. The variables that we will focus 
+on are price, year, manufacturer, region, color, condition, mileage, and title status. A few more columns will be retained to help remove 
+duplicates
+
+```{r}
+# Restrict data to just California
+cars_df <- vehicles %>% filter(state=="ca")
+
+# Select just the columns of interest
+cars_df <- cars_df %>%
+  select(price, year, manufacturer, model, VIN, region, paint_color, condition, odometer, title_status, description, id, posting_date)
+
+# Check for NA values in the data
+round(colSums(is.na(cars_df))/colSums(is.na(cars_df)|!is.na(cars_df)),3)
+```
+There are 51,856 listings and some NAs in possibly important columns (35% NAs in condition). 
+
+Since we will being using the the description to identify missing values, we should first clean it up by removing punctuation and making 
+everything lowercase
+
+
+```{r}
+# These lines will take a while since some descriptions are quite long
+
+# Make the descriptions lower case
+cars_df$description <- tolower(cars_df$description)
+# Remove punctuation except for dollar signs as they will be used later
+cars_df$description <- gsub('[^$[:alnum:][:space:]]+',' ', cars_df$description)
+# Trim whitespace
+cars_df$description <- str_squish(cars_df$description)
+```
+
+
+## Duplicates - the first thing we should do is go through and remove duplicate listings. To do this, we can group the duplicates together 
+and assign all duplicates the same id (we can call it new_id). The difficulty is in determining which cars are duplicates. 
+
+We will assume that listings with the same year, model, manufacturer and description are duplicates (this may not always be the case for 
+dealerships that have several of the same model and just copy/paste the description but if they've included the VIN, the cars will not be 
+recorded as duplicates). After grouping by those variables, we can group cars which have a VIN by their VIN. We don't want to use price or 
+odometer since people who repost their listing will often update these values (and sometimes one was omitted by mistake and fixed in the 
+other posting).
+
+```{r}
+# We want to use the description to group listings but some descriptions are incredibly long, which makes it difficult for R so we can just 
+# take the first 50 characters of the description to match duplicate descriptions
+cars_df <- cars_df %>% mutate(desc_mini = substring(description,1, 50))
+
+# Group all of the cars by year, manufacturer, model and description. There may also be cars that were posted with a VIN in a posting a 
+# without one in another listing, so we'll include all cars.
+cars_df <- cars_df %>%  group_by(year, manufacturer, model, desc_mini) %>% mutate(new_id = max(id)) %>% ungroup()
+
+# For cars that have a VIN, we can group them by their VIN and assign the highest id to the column new_id (since the id is arbitrary it 
+# doesn't really matter what it is as long as it allows us to identify which are duplicate listings). Cars with no VIN will all receive the 
+# same new_id but we'll update it in the following step 
+cars_df[!is.na(cars_df$VIN),] <- cars_df[!is.na(cars_df$VIN),] %>% group_by(VIN) %>% mutate(new_id = max(id))
+```
+
+The original dataset had 51,856 but if we were to only count listings considered unique, we have 33,438 listings. Before we remove the 
+duplicates, we should make sure that we don't remove a duplicate that has relevant data. Also, we need to consider which price to keep and 
+which mileage to keep. We can first start with the price. We can create a dataframe that contains each price for each duplicate and then 
+keep the most recent price (as long as it makes sense - in some cases the most recent price is omitted or is changed to 0 or some other 
+value that doesn't make sense)
+
+
+```{r}
+# We can make a dataset with all of the different prices in different columns for each vehicle
+prices_wide <- cars_df %>% 
+  group_by(new_id) %>%
+  arrange(desc(posting_date)) %>%  # arrange so that the most recent posting comes first
+  mutate(row = row_number()) %>% 
+  pivot_wider(id_cols = new_id, names_from = row, values_from = price)
+
+#  Each car id listed with all prices it was listed at
+prices_wide
+```
+We now have each car combined based on new_id and are displaying all of the prices listed for that car. Notice how the second car was listed 
+7 times with the price being lowered in more recent one being less than the initial price (they likely adjsuted the price). We just want to 
+keep the most recent price - but we need to be careful
+
+```{r}
+# Our methods for detecting duplicates above probably missed some duplicates or recorded a few unique cars as duplicates. We can find the 
+# maximum and minimum price for each car and then look at listings in which these are different to see what's going on. 
+
+my.max <- function(x) ifelse(!all(is.na(x)), max(x, na.rm=T), NA)
+my.min <- function(x) ifelse(!all(is.na(x)), min(x, na.rm=T), NA)
+prices_wide$max <- apply(prices_wide[,-1], MARGIN = 1, FUN = my.max)
+prices_wide$min <- apply(prices_wide[,-1], MARGIN = 1, FUN = my.min)
+prices_wide <- prices_wide %>% select(new_id, max, min, everything())
+
+# We can look at the listings which have different prices but where no prices are zero:
+prices_wide %>% 
+  filter((max-min)/max<1 & (max-min)/max>0) %>%  
+  arrange(by = `1`)
+
+```
+In many cases the minimum value is referring to a down payment or monthly payment amount. In other cases, the cars are just marked down to 
+increase the chance of selling it (but usually not by such a large margin). We can consider the percentage that the minimum is of the maximum 
+to determine what price to use. If the minimum price is less than 50% of the maximum price, it's likely a down payment offer and we will 
+throw that price out
+
+```{r}
+duplicate_price_function <- function(rowvector, percent_cutoff=.5){
+  rowvector <- as.numeric(unlist(rowvector))
+  rowvector <- rowvector[!is.na(rowvector)]
+  rowvector <- rowvector[rowvector/my.max(rowvector)>percent_cutoff]
+  return(rowvector[1])
+}
+
+# Since the prices are arranged with the most recent first, the function will filter out prices that are NA or less than the percent cutoff, 
+# which is 50% by default.
+
+prices_wide$price <- apply(prices_wide[-1], MARGIN = 1, duplicate_price_function) 
+prices_wide <- prices_wide %>% select(new_id, price, max, min, everything())
+prices_wide %>% filter(((max-min)/max)>0 & ((max-min)/max)<1) %>% 
+  arrange(by = `1`)
+
+# The prices look much better now. Now to assign these prices to our cars_df dataframe. There are still a few low prices but we can address them later
+cars_df$price <- prices_wide[match(cars_df$new_id, prices_wide$new_id),]$price
+cars_df[duplicated(cars_df$new_id)|duplicated(cars_df$new_id,fromLast = T),] %>% arrange(new_id)
+```
+Note, we are just updating the values in the columns and not removing duplicates at this point - we want to repeat the process with other 
+observations so that we do inadvertantly remove relevant data
+
+Next, we want to look at the mileage. Some people update the mileage for different posts and sometimes it's just due to a mistake on their 
+part.
+
+```{r}
+# Just as the function above assigned the most appropriate price, the following will assign the most appropriate mileage
+miles_wide <- cars_df %>% 
+  group_by(new_id) %>%
+  arrange(desc(posting_date)) %>% 
+  mutate(row = row_number()) %>% 
+  pivot_wider(id_cols = new_id, names_from = row, values_from = odometer)
+
+miles_wide$max <- apply(miles_wide[,-1], MARGIN = 1, FUN=my.max)
+miles_wide$min <- apply(miles_wide[,-1], MARGIN = 1, FUN=my.min)
+miles_wide[which(miles_wide$max - miles_wide$min >0),]
+# Some cars have different values as the car was driven more, some due to the fact that it was listed at 0 in a posting and some possibly due to a mistake. Since odometers only go up, we'll use the maximum value
+# Assign the correct miles back to our dataframe
+cars_df$odometer <- miles_wide[match(cars_df$new_id, miles_wide$new_id),]$max
+```
+
+
+
+For the other variables, everything is sensible (i.e. title, color, condition may be missing in some observations but they most likely won't chaneg) so we can just take the first non NA element and assign it to all of the duplicate listings to ensure no information is loss when we remove the duplicates. It will also minimize the number of NAs. This may cause some cars which were actually unique to be overwritten and removed but that will only occur with listings that had the same year, make, model and description, and did not report their VIN, so it shouldn't be too common.
+```{r}
+check_na_function <- function(rowvector){
+  rowvector <- rowvector[!is.na(rowvector)]
+  return(rowvector[1])
+}
+# Variables that we'd like to check:
+variables_vector <- c("year", "manufacturer", "model", "paint_color", "condition" ,"title_status")
+
+cars_df
+# A loop that will go through each variable and fix things up
+for(i in 1:length(variables_vector)){
+variable_listings <- cars_df %>%
+  group_by(new_id) %>% 
+  mutate(row = row_number()) %>% 
+  pivot_wider(id_cols = new_id, names_from = row, values_from = variables_vector[i])
+  variable_listings$value <- apply(variable_listings[,-1], MARGIN = 1, check_na_function)
+  cars_df[[which(colnames(cars_df)==variables_vector[i])]] <- 
+    variable_listings[match(cars_df$new_id, variable_listings$new_id),]$value  
+}
+
+# Now to delete the duplicates:
+cars_df <- cars_df %>% filter(!duplicated(cars_df$new_id))
+cars_df <- cars_df %>% select("price", "year", "manufacturer", "model", "odometer", "title_status", "paint_color", "condition", "description", "new_id", "region")
+```
+After removing duplicates, we have 33,524 cars in our dataframe.
+
+
+
+## Years
+The Year should be relatively easy to fix.
+Some cars have year listed as NA but the year is listed in the description so that should be pretty easy to fix by extracting possible years from the description using regex patterns.
+```{r}
+year_na <- cars_df %>% filter(is.na(cars_df$year))
+cars_df[is.na(cars_df$year),]$year <- as.numeric(str_extract(year_na$description, "([1-2][0-9]{3})"))
+cars_df %>% filter(is.na(cars_df$year)) # Now just one car with an NA, since everything is NA, we'll remove this listing
+cars_df <- cars_df %>% filter(!is.na(cars_df$year)) # Removing any rows that would have NA in the year column 
+summary(cars_df$year)
+```
+The minimum year is 1900, so that's probably just carelessness on the part of the poster
+```{r}
+cars_df %>% filter(cars_df$year<=1900)# Just one car. It has the year in the description so we can fix that easily by using the same regew pattern we used above
+cars_df[cars_df$year<=1900,]$year<- as.numeric(str_extract(cars_df[cars_df$year<=1900,]$description, "([1-2][0-9]{3})"))
+summary(cars_df$year)
+# The years are all sensible now
+```
+
+## Price
+The next thing to clean is price. There are both cars with prices too high and too low, which are likely mistakes. There are also cars where the price is NA and cars that list a down payment as their price, which means they don't accurately reflect the price. We can try to extract prices from the description using regex patterns as we did with year, except it may be more difficult in this case
+
+```{r}
+
+# Filtering to deal with just cars that have NA in price column
+price_na <- cars_df %>% filter(is.na(cars_df$price))
+# Find all cars that have a price in the description - we will restrict this to values of 4 digits or more that follow a $ sign
+price_in_description <- price_na[str_detect(price_na$description, "[$](\\d{4,})"),]
+head(price_in_description$description, 1)
+
+```
+From just a single observation we can see that this won't work as the price reflect the minimum monthly income to receive a loan, so we will need to consider the words that occur around the price to determine if it is a usable value or not
+
+```{r}
+# The following code will give us the a few words before and after where the price occurs
+head(unique(str_match_all(price_in_description$description, "(?:[^\\s]+\\s){0,5}[$](\\d{4,})[^\\s]?(?:\\s[^\\s]+){0,5}")))
+```
+After going through all of these, there are certain works the preceded by price. Those words were inserted into the regex pattern to extract prices - in some cases, the only given price was a down payment or other so no price could be extracted; they'll remain as NAs 
+```{r}
+# When the following occur, they're followed by a price, so these cars we can adjust the price from NA.
+price_in_description <- price_in_description %>% filter(str_detect(price_in_description$description,"(?:Asking Price: |Original price is only |SALE PRICE |precio |price is |EZ Price |asking )[$](\\d{4,})"))
+# We can extract these prices and assign them. 
+price_in_description$price <- as.numeric(str_match(price_in_description$description, "(?:Asking Price: |Original price is only |SALE PRICE |precio |price is |EZ Price |asking )[$](\\d{4,})")[,2])
+
+# One is a mistake and conjoins price and the year
+price_in_description[price_in_description$price>1000000,]$price <- 7999
+
+# Assign the prices back to the cars dataframe and then drop the listings that remain NA
+cars_df[match(price_in_description$new_id, cars_df$new_id),]$price <- price_in_description$price
+cars_df<- cars_df %>% filter(!is.na(price))
+```
+
+We can repeat this process for cars that are too cheap (we'll use $1000 as a cutoff) as many listers list payments as the price. This won't remove all of them, but it should improve the price and we can attempt to fix others later
+```{r}
+price_cheap <- cars_df %>% filter(cars_df$price <= 1000)
+price_in_description <- price_cheap[str_detect(price_cheap$description, "[$](\\d{4,})"),]
+
+#Some have an actual price while others are down payments, installment payments, discounts, etc. When the following occur, they're followed by a price, so these cars we can adjust the price from NA.
+price_in_description <- price_in_description %>% filter(str_detect(price_in_description$description,"(?:Asking Price: |Original price is only |SALE PRICE |precio |price is |EZ Price |asking )[$](\\d{4,})"))
+
+# We can extract these prices and assign them. 
+price_in_description$price <- as.numeric(str_match(price_in_description$description, "(?:Asking Price: |Original price is only |SALE PRICE |precio |price is |EZ Price |asking )[$](\\d{4,})")[,2])
+# The last listings mentions there's a loan on the car so we should remove that as it's not representative of the car's value
+price_in_description <- price_in_description[-10,]
+# Assign the prices back to the cars dataframe and then drop the listings that remain NA
+cars_df[match(price_in_description$new_id, cars_df$new_id),]$price <- price_in_description$price
+cars_df <- cars_df %>% filter(price>=1000)
+```
+
+
+Now for the few cars that are priced too high
+```{r}
+cars_df %>% filter(price>400000)
+# None seem to be real cars and are more like advertisements so we can omit them
+cars_df <- cars_df %>% filter(price<400000)
+```
+
+With the excessively priced cars removed, the next thing to deal with is mileage - we can use a similar approach as above to extract mileage from the description and assign these to the mileage
+```{r}
+# Filter for cars with NA in the odometer column
+miles_na <- cars_df %>% filter(is.na(odometer))
+
+# The miles are often followed by the term mi (the pattern will detect 100000 mi or 1000000 miles with or without a space) - The second pattern accounts for mileage with spaces (e.g. 54 000 miles) and the third for mileage the lists thousands with a k (e.g. 54 k miles)
+miles_in_description <- miles_na[str_detect(miles_na$description, "(\\d{3,})[^\\s]?mi"),]
+miles_in_description$description <- str_replace_all(miles_in_description$description, "(?<=\\d) +(?=\\d)", "")
+miles_in_description$description <-str_replace_all(miles_in_description$description, "(\\d+)[kK]", "\\1000")
+
+ 
+unique(str_match(miles_in_description$description, "(?:[^\\s]+\\s){0,5}(\\d{3,}[^\\s]?)mi[^\\s]?(?:\\s[^\\s]+){0,5}")[,2])
+```
+```{r}
+miles_in_description$odometer <- str_match(miles_in_description$description, "(?:[^\\s]+\\s){0,5}(\\d{3,}[^\\s]?)mi[^\\s]?(?:\\s[^\\s]+){0,5}")[,2] 
+
+miles_in_description
+```
+
+
+
+All of the above mileage is 
+```{r}
+# miles_in_description$odometer <- as.numeric(str_extract(miles_in_description$odometer, "\\d{3,}"))
+# miles_in_description[miles_in_description$odometer<1000,]$odometer <- miles_in_description[miles_in_description$odometer<1000,]$odometer*1000
+
+cars_df[match(miles_in_description$new_id, cars_df$new_id),]$odometer <- as.numeric(miles_in_description$odometer)
+
+cars_df <- cars_df %>% filter(odometer>=100)
+
+cars_df %>% filter(year < 2010 & odometer < 400)
+# Cars that are more than 10 years old and were reported to have miles less than 400 miles are likely recorded in the thousands of miles. From the descriptions, there are occasionally vintage cars from the 20s or 30s with hundreds of miles on them so we'll only change the miles of more modern cars under 500
+```
+
+
+```{r}
+cars_df[cars_df$odometer<400 & cars_df$year<2010 & cars_df$year>1940,]$odometer <- cars_df[cars_df$odometer<400 & cars_df$year<2010 & cars_df$year>1940,]$odometer*1000
+
+# Remove cars that likely have mistakes in the mileage
+cars_df <- cars_df %>% filter(!(odometer<1000 & year <2018 & year > 1940))
+
+
+# next, to remove cars with excessively high mileage
+cars_df <- cars_df %>% filter(odometer<400000)
+summary(cars_df$odometer)
+```
+The mileage all appear reasonable as low mileage values all seem to relate to very new cars as we see below
+```{r}
+summary(cars_df[cars_df$odometer<5000,]$year)
+```
+
+
+
+# Searching the descriptions for more information
+For each of the following, we'll search through the description and extract results that match other results that have occurred (for example, we can extract the manufacturer based on the manufacturers that have occurred in our dataset - if it happens to be some manufacturer not in the dataset, it won't be extracted). We can assume that if we end up extracting more than one, it is most likely a dealership selling multiple cars or just a posting that added in a bunch of extra stuff to get more hits. In this case, we'll leave it as NA.
+
+Function for extracting
+```{r}
+  check_length <- function(vector){
+  if(length(vector) == 1)
+    return(vector)
+  else
+    return(NA)
+}
+
+extractor <- function(dataframe, column_name){
+  extract_this <- paste(c(unique(dataframe[[which(colnames(dataframe)==column_name)]])), collapse = "|")
+  extract_list <- str_extract_all(tolower(dataframe[is.na(dataframe[[which(colnames(dataframe)==column_name)]]),]$description), extract_this)
+  extract_list <- lapply(extract_list, unique)
+  extract_vector <- unlist(lapply(extract_list, check_length))
+  return(extract_vector)
+} 
+
+cars_df[is.na(cars_df$manufacturer),]$manufacturer <- extractor(cars_df, "manufacturer")
+cars_df[is.na(cars_df$paint_color),]$paint_color <- na_if(extractor(cars_df, "paint_color"), "other")
+
+cars_df <- cars_df %>% select(price, year, manufacturer, odometer, title_status, paint_color, condition, region)
+summary(cars_df)
+```
+
+```{r}
+
+conditionchanger <- function(condition){
+  if(is.na(condition))
+    return(NA)
+  if(condition=="salvage")
+    return(1)
+  if(condition=="fair")
+    return(2)
+  if(condition=="like new"|condition=="good")
+    return(3)
+  if(condition=="new"|condition=="excellent")
+    return(4)
+  else
+    return(condition)
+  }
+cars_df$condition <- sapply(cars_df$condition, conditionchanger)
+
+summary(cars_df)
+
+# Now for a dataframe that will contain just the response and predictor variables that we may use
+cars_df <- cars_df %>% select(price, year, manufacturer, odometer, title_status, paint_color, condition, region)
+```
+
+
+I want to add a couple of variables that tell us a bit about the class of the car and the country of origin
+```{r}
+country_function <- function(manufacturer){
+  if(is.na(manufacturer))
+    return(NA)
+  if(manufacturer == "chevrolet"|manufacturer =="ford"|manufacturer =="ram"|manufacturer =="saturn"|manufacturer =="chrysler"|
+     manufacturer =="gmc"|manufacturer =="cadillac"|manufacturer =="lincoln"|manufacturer =="dodge"|manufacturer =="jeep"|
+     manufacturer =="buick"|manufacturer =="pontiac"|manufacturer =="mercury"|manufacturer =="tesla"|manufacturer =="harley-davidson")
+     return("USA")
+   if(manufacturer == "nissan"|manufacturer =="honda"|manufacturer =="toyota"|manufacturer =="infiniti"|manufacturer =="lexus"|
+      manufacturer =="mazda"|manufacturer =="acura"|manufacturer =="subaru"|manufacturer =="mitsubishi"|manufacturer =="datsun")
+     return("Japan")
+   if(manufacturer == "kia"|manufacturer =="hyundai")
+     return("Korea")
+   if(manufacturer == "audi"|manufacturer =="bmw"|manufacturer =="porsche"|manufacturer =="mercedes-benz"|manufacturer =="volkswagen")
+     return("Germany")
+   if(manufacturer == "rover"|manufacturer =="mini"|manufacturer =="land rover"|manufacturer =="volvo"|manufacturer =="jaguar"|
+      manufacturer =="aston-martin")
+     return("UK")
+   if(manufacturer == "volvo")
+     return("Sweden")
+   if(manufacturer == "alfa-romeo"|manufacturer =="ferrari"|manufacturer =="fiat")
+     return("Italy")
+   else
+     return("missing")
+}
+
+cars_df$country <- sapply(cars_df$manufacturer, country_function)
+cars_df <- cars_df %>%
+  mutate(manufacturer = as.factor(manufacturer), title_status = as.factor(title_status), paint_color = as.factor(paint_color), country = as.factor(country), region = as.factor(region))
+
+round(colSums(is.na(cars_df))/colSums(is.na(cars_df)|!is.na(cars_df)),3)
+```
+
+The one column that still resulted in a very large portion of NAs was the condition and paint columns. It is likely that people often do not include 
+```{r}
+# For the final dataframe, with both condition and paint color omitted:
+final_df <- drop_na(cars_df %>% 
+              select(-c(condition, paint_color))) # 25,681 cars
+
+# If we wanted to do any sort of analysis involving color, we'd need to use the following, which is much more restricted
+final_df_condition <- drop_na(cars_df %>% 
+              select(-c(condition))) #20,960 cars
+final_df_paint <- drop_na(cars_df %>% 
+              select(-c(paint_color))) # 17,718 cars
+
+
+drop_na(cars_df)
+```
+
+```{r}
+final_df
+```
+
+
+In the end, we have a data for 25,681 cars which is approximately half the original dataset. The dataset should be almost entirely free of duplicates and all NA values have been removed, so it would now be ready for the analysis stage.
