@@ -9,7 +9,7 @@ dataset is pretty messy with a lot of duplicate observation with
 different values given (e.g. the same car may be posted multiple times
 with different prices or with the lister omitting certain information
 for specific variables). Listers may also place relevant information in
-the description instead of placing it in the designated column -
+thedescription instead of placing it in the designated column -
 something that we can try to fix using regex patterns to remedy.
 
 # Libraries and Data Importing
@@ -95,13 +95,8 @@ cars_df$description <- gsub('[^$[:alnum:][:space:]]+',' ', cars_df$description)
 cars_df$description <- str_squish(cars_df$description)
 ```
 
-## Duplicates - the first thing we should do is go through and remove duplicate listings. To do this, we can group the duplicates together
+## Duplicates - the first thing we should do is go through and remove duplicate listings. To do this, we can group the duplicates together and assign all duplicates the same id (we can call it new\_id). The difficulty is in determining which cars are duplicates. We will assume that listings with the same year, model, manufacturer and description are duplicates (this may not always be the case for
 
-and assign all duplicates the same id (we can call it new\_id). The
-difficulty is in determining which cars are duplicates.
-
-We will assume that listings with the same year, model, manufacturer and
-description are duplicates (this may not always be the case for
 dealerships that have several of the same model and just copy/paste the
 description but if they’ve included the VIN, the cars will not be
 recorded as duplicates). After grouping by those variables, we can group
