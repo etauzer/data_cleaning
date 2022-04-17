@@ -3,11 +3,7 @@ title: "Data Cleaning Project Used Cars in California"
 output: rmarkdown::github_document
 ---
 
-The purpose of this project is for me to get experience with data cleaning using both base R and tidyverse (dplyr) libraries along with regex
-patterns that will be used to extract missing values from other variables. The dataset is on used car listing from Craigslist. The dataset is
-pretty messy with a lot of duplicate observation with different values given (e.g. the same car may be posted multiple times with different 
-prices or with the lister omitting certain information for specific variables). Listers may also place relevant information in the 
-description instead of placing it in the designated column - something that we can try to fix using regex patterns to remedy. 
+The purpose of this project is for me to get experience with data cleaning using both base R and tidyverse (dplyr) libraries along with regex patterns that will be used to extract missing values from other variables. The dataset is on used car listing from Craigslist. The dataset is pretty messy with a lot of duplicate observation with different values given (e.g. the same car may be posted multiple times with different prices or with the lister omitting certain information for specific variables). Listers may also place relevant information in thedescription instead of placing it in the designated column - something that we can try to fix using regex patterns to remedy. 
 
 # Libraries and Data Importing
 ```{r}
@@ -19,9 +15,7 @@ vehicles <- read_csv("C:/Users/Wetauzer/Desktop/data/unsorted/vehicles.csv")
 
 
 ## Summary of Vehicles
-To start off, we will restrict the dataset to just cars in California to make the dataset easier to handle. The variables that we will focus 
-on are price, year, manufacturer, region, color, condition, mileage, and title status. A few more columns will be retained to help remove 
-duplicates
+To start off, we will restrict the dataset to just cars in California to make the dataset easier to handle. The variables that we will focus on are price, year, manufacturer, region, color, condition, mileage, and title status. A few more columns will be retained to help remove duplicates
 
 ```{r}
 # Restrict data to just California
@@ -36,10 +30,7 @@ round(colSums(is.na(cars_df))/colSums(is.na(cars_df)|!is.na(cars_df)),3)
 ```
 There are 51,856 listings and some NAs in possibly important columns (35% NAs in condition). 
 
-Since we will being using the the description to identify missing values, we should first clean it up by removing punctuation and making 
-everything lowercase
-
-
+Since we will being using the the description to identify missing values, we should first clean it up by removing punctuation and making everything lowercase
 ```{r}
 # These lines will take a while since some descriptions are quite long
 
@@ -52,14 +43,8 @@ cars_df$description <- str_squish(cars_df$description)
 ```
 
 
-## Duplicates - the first thing we should do is go through and remove duplicate listings. To do this, we can group the duplicates together 
-and assign all duplicates the same id (we can call it new_id). The difficulty is in determining which cars are duplicates. 
-
-We will assume that listings with the same year, model, manufacturer and description are duplicates (this may not always be the case for 
-dealerships that have several of the same model and just copy/paste the description but if they've included the VIN, the cars will not be 
-recorded as duplicates). After grouping by those variables, we can group cars which have a VIN by their VIN. We don't want to use price or 
-odometer since people who repost their listing will often update these values (and sometimes one was omitted by mistake and fixed in the 
-other posting).
+## Duplicates - the first thing we should do is go through and remove duplicate listings. To do this, we can group the duplicates together and assign all duplicates the same id (we can call it new_id). The difficulty is in determining which cars are duplicates. We will assume that listings with the same year, model, manufacturer and description are duplicates (this may not always be the case for 
+dealerships that have several of the same model and just copy/paste the description but if they've included the VIN, the cars will not be recorded as duplicates). After grouping by those variables, we can group cars which have a VIN by their VIN. We don't want to use price or odometer since people who repost their listing will often update these values (and sometimes one was omitted by mistake and fixed in the other posting).
 
 ```{r}
 # We want to use the description to group listings but some descriptions are incredibly long, which makes it difficult for R so we can just 
@@ -77,10 +62,7 @@ cars_df[!is.na(cars_df$VIN),] <- cars_df[!is.na(cars_df$VIN),] %>% group_by(VIN)
 ```
 
 The original dataset had 51,856 but if we were to only count listings considered unique, we have 33,438 listings. Before we remove the 
-duplicates, we should make sure that we don't remove a duplicate that has relevant data. Also, we need to consider which price to keep and 
-which mileage to keep. We can first start with the price. We can create a dataframe that contains each price for each duplicate and then 
-keep the most recent price (as long as it makes sense - in some cases the most recent price is omitted or is changed to 0 or some other 
-value that doesn't make sense)
+duplicates, we should make sure that we don't remove a duplicate that has relevant data. Also, we need to consider which price to keep and which mileage to keep. We can first start with the price. We can create a dataframe that contains each price for each duplicate and then keep the most recent price (as long as it makes sense - in some cases the most recent price is omitted or is changed to 0 or some other value that doesn't make sense)
 
 
 ```{r}
@@ -94,9 +76,7 @@ prices_wide <- cars_df %>%
 #  Each car id listed with all prices it was listed at
 prices_wide
 ```
-We now have each car combined based on new_id and are displaying all of the prices listed for that car. Notice how the second car was listed 
-7 times with the price being lowered in more recent one being less than the initial price (they likely adjsuted the price). We just want to 
-keep the most recent price - but we need to be careful
+We now have each car combined based on new_id and are displaying all of the prices listed for that car. Notice how the second car was listed 7 times with the price being lowered in more recent one being less than the initial price (they likely adjsuted the price). We just want to keep the most recent price - but we need to be careful
 
 ```{r}
 # Our methods for detecting duplicates above probably missed some duplicates or recorded a few unique cars as duplicates. We can find the 
@@ -114,10 +94,7 @@ prices_wide %>%
   arrange(by = `1`)
 
 ```
-In many cases the minimum value is referring to a down payment or monthly payment amount. In other cases, the cars are just marked down to 
-increase the chance of selling it (but usually not by such a large margin). We can consider the percentage that the minimum is of the maximum 
-to determine what price to use. If the minimum price is less than 50% of the maximum price, it's likely a down payment offer and we will 
-throw that price out
+In many cases the minimum value is referring to a down payment or monthly payment amount. In other cases, the cars are just marked down to increase the chance of selling it (but usually not by such a large margin). We can consider the percentage that the minimum is of the maximum to determine what price to use. If the minimum price is less than 50% of the maximum price, it's likely a down payment offer and we will throw that price out
 
 ```{r}
 duplicate_price_function <- function(rowvector, percent_cutoff=.5){
@@ -139,11 +116,9 @@ prices_wide %>% filter(((max-min)/max)>0 & ((max-min)/max)<1) %>%
 cars_df$price <- prices_wide[match(cars_df$new_id, prices_wide$new_id),]$price
 cars_df[duplicated(cars_df$new_id)|duplicated(cars_df$new_id,fromLast = T),] %>% arrange(new_id)
 ```
-Note, we are just updating the values in the columns and not removing duplicates at this point - we want to repeat the process with other 
-observations so that we do inadvertantly remove relevant data
+Note, we are just updating the values in the columns and not removing duplicates at this point - we want to repeat the process with other observations so that we do inadvertantly remove relevant data
 
-Next, we want to look at the mileage. Some people update the mileage for different posts and sometimes it's just due to a mistake on their 
-part.
+Next, we want to look at the mileage. Some people update the mileage for different posts and sometimes it's just due to a mistake on their part.
 
 ```{r}
 # Just as the function above assigned the most appropriate price, the following will assign the most appropriate mileage
